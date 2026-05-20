@@ -1,7 +1,7 @@
 // Vercel Serverless Function
 // Ruta: /api/analyze.js
 
-module.exports = async function handler(req, res) {
+module.exports = async (req, res) => {
   // Solo acepta POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
