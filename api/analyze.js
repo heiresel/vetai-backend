@@ -15,21 +15,21 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' })
     }
 
-    const GROQ_API_KEY = process.env.GROQ_API_KEY
-    const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+    const AGNES_API_KEY = process.env.AGNES_API_KEY
+    const AGNES_URL = 'https://apihub.agnes-ai.com/v1/chat/completions'
 
     // Construir prompt (mismo que en aiService.js)
     const prompt = buildPrompt(species, analysisType || 'general', symptoms || '')
 
-    // Llamar a Groq
-    const response = await fetch(GROQ_URL, {
+    // Llamar a Agnes AI
+    const response = await fetch(AGNES_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Authorization': `Bearer ${AGNES_API_KEY}`,
       },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'agnes-2.0-flash',
         messages: [
           {
             role: 'user',
@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
             ],
           },
         ],
-        max_tokens: 600,
+        max_tokens: 1500,
         temperature: 0.1,
         response_format: { type: 'json_object' },
       }),
@@ -55,15 +55,15 @@ module.exports = async (req, res) => {
 
     if (!response.ok) {
       const error = await response.json()
-      console.error('Groq API error:', error)
-      return res.status(response.status).json({ error: 'Groq API failed', details: error })
+      console.error('Agnes API error:', error)
+      return res.status(response.status).json({ error: 'Agnes API failed', details: error })
     }
 
     const data = await response.json()
     const text = data.choices?.[0]?.message?.content
 
     if (!text) {
-      return res.status(500).json({ error: 'Empty response from Groq' })
+      return res.status(500).json({ error: 'Empty response from Agnes' })
     }
 
     // Parsear respuesta
