@@ -15,8 +15,8 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'Missing or invalid messages array' })
     }
 
-    const GROQ_API_KEY = process.env.GROQ_API_KEY
-    const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+    const AGNES_API_KEY = process.env.AGNES_API_KEY
+    const AGNES_URL = 'https://apihub.agnes-ai.com/v1/chat/completions'
 
     const SYSTEM_PROMPT = `Sos el Dr. VetExotic — veterinario especialista con posgrado mundial en medicina de animales exóticos (reptiles, anfibios, arácnidos, mamíferos exóticos y aves no convencionales). Tenés más de 20 años de experiencia exclusiva.
 
@@ -48,22 +48,22 @@ Respondés de forma concisa pero completa — máximo 3-4 párrafos cortos.
 Cuando el caso es grave, siempre recomendás visitar al veterinario.
 Al final de cada respuesta sobre un problema específico, agregás: "⚠️ Recuerda que este consejo es orientativo y no reemplaza la consulta veterinaria presencial."`
 
-    // Construir el payload para Groq
-    const groqMessages = [
+    // Construir el payload para Agnes AI
+    const agnesMessages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...messages
     ]
 
     // Si hay imagen en base64, agregarla al último mensaje del usuario
     if (base64Image) {
-      const lastUserMsgIndex = groqMessages.map(m => m.role).lastIndexOf('user')
+      const lastUserMsgIndex = agnesMessages.map(m => m.role).lastIndexOf('user')
       if (lastUserMsgIndex !== -1) {
-        const lastMsg = groqMessages[lastUserMsgIndex]
+        const lastMsg = agnesMessages[lastUserMsgIndex]
         const textContent = typeof lastMsg.content === 'string' 
           ? lastMsg.content 
           : 'Por favor analizá esta foto de mi mascota y decime qué observás.'
 
-        groqMessages[lastUserMsgIndex] = {
+        agnesMessages[lastUserMsgIndex] = {
           role: 'user',
           content: [
             { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
@@ -73,26 +73,26 @@ Al final de cada respuesta sobre un problema específico, agregás: "⚠️ Recu
       }
     }
 
-    // Llamar a Groq
-    const response = await fetch(GROQ_URL, {
+    // Llamar a Agnes AI
+    const response = await fetch(AGNES_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Authorization': `Bearer ${AGNES_API_KEY}`,
       },
       body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: groqMessages,
-        max_tokens: 600,
+        model: 'agnes-2.0-flash',
+        messages: agnesMessages,
+        max_tokens: 1500,
         temperature: 0.3,
       }),
     })
 
     if (!response.ok) {
       const error = await response.json()
-      console.error('Groq API error:', error)
+      console.error('Agnes API error:', error)
       return res.status(response.status).json({ 
-        error: 'Groq API failed', 
+        error: 'Agnes API failed', 
         details: error 
       })
     }
@@ -100,9 +100,9 @@ Al final de cada respuesta sobre un problema específico, agregás: "⚠️ Recu
     const data = await response.json()
 
     if (data.error) {
-      console.error('Groq error response:', data.error)
+      console.error('Agnes error response:', data.error)
       return res.status(500).json({ 
-        error: 'Groq error', 
+        error: 'Agnes error', 
         message: data.error.message || 'Unknown error' 
       })
     }
@@ -110,7 +110,7 @@ Al final de cada respuesta sobre un problema específico, agregás: "⚠️ Recu
     const reply = data.choices?.[0]?.message?.content
 
     if (!reply) {
-      return res.status(500).json({ error: 'Empty response from Groq' })
+      return res.status(500).json({ error: 'Empty response from Agnes' })
     }
 
     // Respuesta exitosa
