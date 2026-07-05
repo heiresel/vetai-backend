@@ -2,14 +2,44 @@
 // Ruta: /api/verify-purchase.js
 
 const { GoogleAuth } = require('google-auth-library')
+const { Redis } = require('@upstash/redis')
+const { Ratelimit } = require('@upstash/ratelimit')
 
 const PACKAGE_NAME = 'com.heiresel.vetai'
 const PRODUCT_ID = 'vetai_pro_monthly'
+
+// Rate limiter — fuera del handler para reusarse entre invocaciones warm.
+// Los nombres de env vars son los compuestos que generó la integración
+// Upstash del Marketplace con prefijo custom (no los que fromEnv() busca).
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_KV_REST_API_URL,
+  token: process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN,
+})
+
+const ratelimit = new Ratelimit({
+  redis,
+  limiter: Ratelimit.slidingWindow(10, '60 s'),
+  prefix: 'vetai:verify',
+})
 
 module.exports = async (req, res) => {
   // Solo acepta POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
+  }
+
+  // Rate limit por IP — antes de cualquier otra validación.
+  // Fail-open: si Redis falla, no bloquear compras reales.
+  const ip = (req.headers['x-forwarded-for'] || 'unknown').split(',')[0].trim()
+  try {
+    const { success, remaining } = await ratelimit.limit(ip)
+    if (!success) {
+      console.warn(`[RATE-LIMIT] IP bloqueada: ${ip} — límite 10/60s superado`)
+      return res.status(429).json({ error: 'Too many requests. Try again in a minute.' })
+    }
+    console.log(`[RATE-LIMIT] IP ${ip} OK — ${remaining} requests restantes en la ventana`)
+  } catch (rlErr) {
+    console.error('[RATE-LIMIT] Error consultando Redis, continuando sin límite:', rlErr.message)
   }
 
   // Verificar token interno
