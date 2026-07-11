@@ -1,27 +1,123 @@
 // Vercel Serverless Function
 // Ruta: /api/analyze.js
+//
+// Requiere sesión de Google (idToken) + token interno de la app.
+// La cuota (5 análisis / 30 días) se valida y consume atómicamente en
+// Redis ANTES de llamar a Agnes AI — fail-closed: si Redis no responde, se
+// bloquea el análisis en vez de arriesgar un doble gasto o un uso gratis
+// no contabilizado.
+
+const { Redis } = require('@upstash/redis')
+const { Ratelimit } = require('@upstash/ratelimit')
+const { verifyIdToken } = require('../lib/googleAuth')
+const { consumeQuota, refundQuota, isPro } = require('../lib/quota')
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_KV_REST_API_URL,
+  token: process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN,
+})
+
+// Rate limit por IP — protege contra abuso anónimo antes de gastar CPU
+// verificando el idToken. Fail-open (igual criterio que verify-purchase.js):
+// si Redis cae, no queremos que el rate limiter bloquee análisis legítimos
+// — para eso ya está el fail-closed de la cuota en sí.
+const ipRatelimit = new Ratelimit({
+  redis,
+  limiter: Ratelimit.slidingWindow(20, '60 s'),
+  prefix: 'vetai:rl:analyze:ip',
+})
+
+// Rate limit por cuenta — más estricto, evita que una sola cuenta agote
+// Agnes en ráfaga aunque tenga cuota disponible.
+const subRatelimit = new Ratelimit({
+  redis,
+  limiter: Ratelimit.slidingWindow(6, '60 s'),
+  prefix: 'vetai:rl:analyze:sub',
+})
 
 module.exports = async (req, res) => {
-  // Solo acepta POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
+  // ── Rate limit por IP ──────────────────────────────────────────
+  const ip = (req.headers['x-forwarded-for'] || 'unknown').split(',')[0].trim()
   try {
-    const { base64Image, species, analysisType, symptoms } = req.body
+    const { success } = await ipRatelimit.limit(ip)
+    if (!success) {
+      return res.status(429).json({ error: 'Too many requests. Try again in a minute.' })
+    }
+  } catch (rlErr) {
+    console.error('[RATE-LIMIT] Error consultando Redis (IP), continuando sin límite:', rlErr.message)
+  }
 
-    // Validaciones
-    if (!base64Image || !species) {
-      return res.status(400).json({ error: 'Missing required fields' })
+  // ── Token interno de la app ────────────────────────────────────
+  const internalToken = req.headers['x-internal-token']
+  if (!internalToken || internalToken !== process.env.INTERNAL_API_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+
+  // ── Sesión de Google ────────────────────────────────────────────
+  const { idToken, base64Image, species, analysisType, symptoms } = req.body
+
+  const account = await verifyIdToken(idToken)
+  if (!account) {
+    return res.status(401).json({ error: 'invalid_session', message: 'Sign in with Google required.' })
+  }
+  const { sub } = account
+
+  // ── Rate limit por cuenta ───────────────────────────────────────
+  try {
+    const { success } = await subRatelimit.limit(sub)
+    if (!success) {
+      return res.status(429).json({ error: 'Too many requests. Try again in a minute.' })
+    }
+  } catch (rlErr) {
+    console.error('[RATE-LIMIT] Error consultando Redis (sub), continuando sin límite:', rlErr.message)
+  }
+
+  if (!base64Image || !species) {
+    return res.status(400).json({ error: 'Missing required fields' })
+  }
+
+  // ── Cuota (fail-closed) ──────────────────────────────────────────
+  let userIsPro = false
+  try {
+    userIsPro = await isPro(sub)
+  } catch (err) {
+    console.error('analyze: error verificando estado Pro:', err.message)
+    return res.status(503).json({ error: 'quota_unavailable', message: 'Could not verify your account status. Try again.' })
+  }
+
+  let quotaResult = null
+  if (!userIsPro) {
+    try {
+      quotaResult = await consumeQuota(sub, 'analyses_used')
+    } catch (err) {
+      console.error('analyze: error consumiendo cuota:', err.message)
+      return res.status(503).json({ error: 'quota_unavailable', message: 'Could not verify your quota. Try again.' })
     }
 
+    if (!quotaResult.allowed) {
+      return res.status(429).json({
+        error: 'analyses_exhausted',
+        message: 'Free analyses used up for this cycle.',
+        quota: {
+          analysesRemaining: quotaResult.remaining,
+          resetAt: quotaResult.resetAt,
+          isPro: false,
+        },
+      })
+    }
+  }
+
+  // ── Llamada a Agnes AI ───────────────────────────────────────────
+  try {
     const AGNES_API_KEY = process.env.AGNES_API_KEY
     const AGNES_URL = 'https://apihub.agnes-ai.com/v1/chat/completions'
 
-    // Construir prompt (mismo que en aiService.js)
     const prompt = buildPrompt(species, analysisType || 'general', symptoms || '')
 
-    // Llamar a Agnes AI
     const response = await fetch(AGNES_URL, {
       method: 'POST',
       headers: {
@@ -56,6 +152,7 @@ module.exports = async (req, res) => {
     if (!response.ok) {
       const error = await response.json()
       console.error('Agnes API error:', error)
+      if (quotaResult) await refundQuota(sub, 'analyses_used')
       return res.status(response.status).json({ error: 'Agnes API failed', details: error })
     }
 
@@ -63,12 +160,13 @@ module.exports = async (req, res) => {
     const text = data.choices?.[0]?.message?.content
 
     if (!text) {
+      if (quotaResult) await refundQuota(sub, 'analyses_used')
       return res.status(500).json({ error: 'Empty response from Agnes' })
     }
 
-    // Parsear respuesta
     const parsed = extractJSON(text)
     if (!parsed) {
+      if (quotaResult) await refundQuota(sub, 'analyses_used')
       return res.status(500).json({ error: 'Could not parse response' })
     }
 
@@ -76,7 +174,6 @@ module.exports = async (req, res) => {
       ? parsed.severity
       : 'bajo'
 
-    // Respuesta final
     return res.status(200).json({
       diagnosis: parsed.diagnosis || 'Análisis completado.',
       confidence: Math.min(97, Math.max(0, parseInt(parsed.confidence) || 82)),
@@ -86,10 +183,14 @@ module.exports = async (req, res) => {
         ? parsed.recommendations.slice(0, 4)
         : ['Consultá con un veterinario especializado en exóticos.'],
       isInvalid: severity === 'invalida',
+      quota: userIsPro
+        ? { isPro: true }
+        : { analysesRemaining: quotaResult.remaining, resetAt: quotaResult.resetAt, isPro: false },
     })
 
   } catch (error) {
     console.error('Server error:', error)
+    if (quotaResult) await refundQuota(sub, 'analyses_used')
     return res.status(500).json({ error: 'Internal server error', message: error.message })
   }
 }

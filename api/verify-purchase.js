@@ -4,6 +4,8 @@
 const { GoogleAuth } = require('google-auth-library')
 const { Redis } = require('@upstash/redis')
 const { Ratelimit } = require('@upstash/ratelimit')
+const { verifyIdToken } = require('../lib/googleAuth')
+const { setProStatus, clearProStatus } = require('../lib/quota')
 
 const PACKAGE_NAME = 'com.heiresel.vetai'
 const PRODUCT_ID = 'vetai_pro_monthly'
@@ -49,11 +51,23 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const { purchaseToken } = req.body
+    const { purchaseToken, idToken } = req.body
 
     // Validación
     if (!purchaseToken) {
       return res.status(400).json({ error: 'Missing purchaseToken' })
+    }
+
+    // idToken es OPCIONAL — mantiene compatibilidad con el flujo de
+    // verificación que ya existía antes de la migración a quota server-side.
+    // Si viene, marcamos/limpiamos vetai:pro:{sub} en Redis para que
+    // analyze.js y chat.js puedan saltear la cuota con evidencia server-side.
+    let account = null
+    if (idToken) {
+      account = await verifyIdToken(idToken)
+      if (!account) {
+        console.warn('verify-purchase: idToken presente pero inválido — se ignora, no bloquea la verificación de compra')
+      }
     }
 
     // Autenticación con Google
@@ -80,6 +94,7 @@ module.exports = async (req, res) => {
 
     if (response.status === 404) {
       console.log('Purchase not found:', purchaseToken)
+      if (account) await clearProStatus(account.sub)
       return res.status(200).json({ valid: false, reason: 'purchase_not_found' })
     }
 
@@ -94,15 +109,18 @@ module.exports = async (req, res) => {
 
     if (!expiryTimeMillis) {
       console.log('Purchase valid (no expiryTimeMillis - new purchase):', purchaseToken)
+      if (account) await setProStatus(account.sub, null)
       return res.status(200).json({ valid: true, expiryTimeMillis: null })
     }
 
     if (parseInt(expiryTimeMillis) > Date.now()) {
       console.log('Purchase valid, expires:', new Date(parseInt(expiryTimeMillis)).toISOString())
+      if (account) await setProStatus(account.sub, parseInt(expiryTimeMillis))
       return res.status(200).json({ valid: true, expiryTimeMillis })
     }
 
     console.log('Subscription expired at:', new Date(parseInt(expiryTimeMillis)).toISOString())
+    if (account) await clearProStatus(account.sub)
     return res.status(200).json({ valid: false, reason: 'subscription_expired' })
 
   } catch (error) {
