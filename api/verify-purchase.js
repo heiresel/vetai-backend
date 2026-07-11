@@ -66,7 +66,33 @@ module.exports = async (req, res) => {
     if (idToken) {
       account = await verifyIdToken(idToken)
       if (!account) {
-        console.warn('verify-purchase: idToken presente pero inválido — se ignora, no bloquea la verificación de compra')
+        console.warn('[PRO-STATUS] idToken presente pero inválido — se ignora, no bloquea la verificación de compra. purchaseToken:', purchaseToken.slice(0, 20) + '…')
+      } else {
+        console.log('[PRO-STATUS] idToken válido, sub resuelto:', account.sub)
+      }
+    } else {
+      console.warn('[PRO-STATUS] Sin idToken en el body — no se puede marcar vetai:pro:{sub} para esta verificación. purchaseToken:', purchaseToken.slice(0, 20) + '…')
+    }
+
+    // Wrapper con logging explícito de éxito/fallo — setProStatus/clearProStatus
+    // NO deben poder tirar abajo la respuesta de verificación de compra (que
+    // ya es válida según Google Play) solo porque Redis falló. Antes, una
+    // excepción acá caía en el catch general del handler y devolvía 500 sin
+    // dejar rastro de que la compra SÍ era válida pero el marcado Pro falló.
+    const markProStatus = async (sub, expiryTimeMillis) => {
+      try {
+        await setProStatus(sub, expiryTimeMillis)
+        console.log('[PRO-STATUS] ✅ setProStatus OK — sub:', sub, 'expiryTimeMillis:', expiryTimeMillis)
+      } catch (err) {
+        console.error('[PRO-STATUS] ❌ setProStatus FALLÓ — sub:', sub, 'expiryTimeMillis:', expiryTimeMillis, 'error:', err.message)
+      }
+    }
+    const markProCleared = async (sub, reason) => {
+      try {
+        await clearProStatus(sub)
+        console.log('[PRO-STATUS] ✅ clearProStatus OK — sub:', sub, 'reason:', reason)
+      } catch (err) {
+        console.error('[PRO-STATUS] ❌ clearProStatus FALLÓ — sub:', sub, 'reason:', reason, 'error:', err.message)
       }
     }
 
@@ -94,7 +120,7 @@ module.exports = async (req, res) => {
 
     if (response.status === 404) {
       console.log('Purchase not found:', purchaseToken)
-      if (account) await clearProStatus(account.sub)
+      if (account) await markProCleared(account.sub, 'purchase_not_found')
       return res.status(200).json({ valid: false, reason: 'purchase_not_found' })
     }
 
@@ -109,18 +135,18 @@ module.exports = async (req, res) => {
 
     if (!expiryTimeMillis) {
       console.log('Purchase valid (no expiryTimeMillis - new purchase):', purchaseToken)
-      if (account) await setProStatus(account.sub, null)
+      if (account) await markProStatus(account.sub, null)
       return res.status(200).json({ valid: true, expiryTimeMillis: null })
     }
 
     if (parseInt(expiryTimeMillis) > Date.now()) {
       console.log('Purchase valid, expires:', new Date(parseInt(expiryTimeMillis)).toISOString())
-      if (account) await setProStatus(account.sub, parseInt(expiryTimeMillis))
+      if (account) await markProStatus(account.sub, parseInt(expiryTimeMillis))
       return res.status(200).json({ valid: true, expiryTimeMillis })
     }
 
     console.log('Subscription expired at:', new Date(parseInt(expiryTimeMillis)).toISOString())
-    if (account) await clearProStatus(account.sub)
+    if (account) await markProCleared(account.sub, 'subscription_expired')
     return res.status(200).json({ valid: false, reason: 'subscription_expired' })
 
   } catch (error) {
